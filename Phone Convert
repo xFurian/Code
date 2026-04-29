@@ -1,0 +1,309 @@
+<#
+Disclaimer
+The sample scripts are not supported under any Microsoft standard support program or service.
+The sample scripts are provided AS IS without warranty of any kind. Microsoft further disclaims all implied warranties
+including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
+The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts
+be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
+loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
+documentation, even if Microsoft has been advised of the possibility of such damages.
+#>
+# =========================================
+# Combined: Phone Auth Discovery + SMS Default Sign-In Conversion
+# Phase 1: Discover & categorize all users
+# Phase 2: Convert eligible users, export failures
+# Requires: Microsoft.Graph modules + ImportExcel (optional, falls back to CSV)
+# =========================================
+
+Import-Module Microsoft.Graph.Identity.SignIns
+Import-Module Microsoft.Graph.Users.Actions
+
+# --- Single connection with all required scopes ---
+Connect-MgGraph -Scopes @(
+    "UserAuthenticationMethod.Read.All",
+    "UserAuthenticationMethod.ReadWrite.All",
+    "User.Read.All"
+)
+
+# --- Output paths ---
+$timestamp       = Get-Date -Format 'yyyyMMdd_HHmm'
+$reportPath      = "C:\PhoneAuth_FullReport_$timestamp.xlsx"
+$failurePath     = "C:\PhoneAuth_Failures_$timestamp.xlsx"
+$useExcel        = $null -ne (Get-Module -ListAvailable -Name ImportExcel)
+
+if (-not $useExcel) {
+    Write-Host "ImportExcel module not found. Output will fall back to CSV." -ForegroundColor Yellow
+    $reportPath  = $reportPath  -replace '\.xlsx$', '.csv'
+    $failurePath = $failurePath -replace '\.xlsx$', '.csv'
+}
+
+# --- Collections ---
+$allResults      = [System.Collections.Generic.List[PSCustomObject]]::new()
+$eligible        = [System.Collections.Generic.List[PSCustomObject]]::new()  # Can be converted to SMS
+$willFail        = [System.Collections.Generic.List[PSCustomObject]]::new()  # Will error on conversion
+$changeSuccess   = [System.Collections.Generic.List[PSCustomObject]]::new()
+$changeFailure   = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+# =============================================
+# PHASE 1 — DISCOVERY
+# =============================================
+Write-Host "`n===== PHASE 1: DISCOVERY =====" -ForegroundColor Cyan
+Write-Host "Retrieving all users..." -ForegroundColor Cyan
+
+$users   = Get-MgUser -All -Property Id, DisplayName, UserPrincipalName, OfficeLocation, JobTitle, Department
+$total   = $users.Count
+$counter = 0
+
+foreach ($user in $users) {
+    $counter++
+    Write-Progress -Activity "Discovering phone auth methods" `
+                   -Status "$counter of $total — $($user.UserPrincipalName)" `
+                   -PercentComplete (($counter / $total) * 100)
+
+    try {
+        $phoneMethods = Get-MgUserAuthenticationPhoneMethod -UserId $user.Id -ErrorAction Stop
+
+        if (-not $phoneMethods) {
+            # No phone methods registered at all
+            $entry = [PSCustomObject]@{
+                UserPrincipalName  = $user.UserPrincipalName
+                DisplayName        = $user.DisplayName
+                Department         = $user.Department
+                JobTitle           = $user.JobTitle
+                PhoneType          = "None"
+                PhoneNumber        = "N/A"
+                SMSCapable         = "No"
+                VoiceCapable       = "No"
+                OfficePhonePresent = "No"
+                MobilePhonePresent = "No"
+                RegisteredMethod   = "None Registered"
+                SupportStatus      = "Not Configured"
+                ConversionEligible = "No"
+                FailureReason      = "No phone authentication method registered"
+            }
+            $allResults.Add($entry)
+            $willFail.Add($entry)
+            continue
+        }
+
+        # Check if this user has at least one mobile/alternateMobile method (SMS-capable)
+        $hasMobile = $phoneMethods | Where-Object { $_.PhoneType -in @("mobile", "alternateMobile") }
+
+        foreach ($method in $phoneMethods) {
+            $phoneType  = $method.PhoneType
+            $smsCapable = $phoneType -in @("mobile", "alternateMobile")
+
+            $registeredMethod = if ($smsCapable) { "SMS + Voice" } else { "Voice Only" }
+
+            $supportStatus = switch ($phoneType) {
+                "mobile"          { "Supported (Mobile)" }
+                "alternateMobile" { "Supported (Alternate Mobile)" }
+                "office"          { "Limited (Voice Only — No SMS)" }
+                default           { "Unknown" }
+            }
+
+            # Eligibility is per-user (not per-method): user needs at least one mobile method
+            $isEligible   = [bool]$hasMobile
+            $failReason   = if (-not $isEligible) { "No mobile phone method — voice/office only" } else { "" }
+
+            $entry = [PSCustomObject]@{
+                UserPrincipalName  = $user.UserPrincipalName
+                DisplayName        = $user.DisplayName
+                Department         = $user.Department
+                JobTitle           = $user.JobTitle
+                PhoneType          = $phoneType
+                PhoneNumber        = $method.PhoneNumber
+                SMSCapable         = if ($smsCapable)   { "Yes" } else { "No" }
+                VoiceCapable       = "Yes"
+                OfficePhonePresent = if ($phoneType -eq "office") { "Yes" } else { "No" }
+                MobilePhonePresent = if ($phoneType -in @("mobile","alternateMobile")) { "Yes" } else { "No" }
+                RegisteredMethod   = $registeredMethod
+                SupportStatus      = $supportStatus
+                ConversionEligible = if ($isEligible) { "Yes" } else { "No" }
+                FailureReason      = $failReason
+            }
+            $allResults.Add($entry)
+        }
+
+        # Add to eligible or willFail (deduplicate per user)
+        if ($hasMobile) {
+            if (-not ($eligible | Where-Object { $_.UserPrincipalName -eq $user.UserPrincipalName })) {
+                $eligible.Add([PSCustomObject]@{
+                    UserPrincipalName = $user.UserPrincipalName
+                    DisplayName       = $user.DisplayName
+                    UserId            = $user.Id
+                })
+            }
+        } else {
+            if (-not ($willFail | Where-Object { $_.UserPrincipalName -eq $user.UserPrincipalName })) {
+                $willFail.Add(($allResults | Where-Object { $_.UserPrincipalName -eq $user.UserPrincipalName } | Select-Object -First 1))
+            }
+        }
+    }
+    catch {
+        $entry = [PSCustomObject]@{
+            UserPrincipalName  = $user.UserPrincipalName
+            DisplayName        = $user.DisplayName
+            Department         = $user.Department
+            JobTitle           = $user.JobTitle
+            PhoneType          = "ERROR"
+            PhoneNumber        = "N/A"
+            SMSCapable         = "N/A"
+            VoiceCapable       = "N/A"
+            OfficePhonePresent = "N/A"
+            MobilePhonePresent = "N/A"
+            RegisteredMethod   = "Query Failed"
+            SupportStatus      = "Error"
+            ConversionEligible = "No"
+            FailureReason      = $_.Exception.Message
+        }
+        $allResults.Add($entry)
+        $willFail.Add($entry)
+    }
+}
+Write-Progress -Activity "Discovering phone auth methods" -Completed
+
+# --- Phase 1 Summary ---
+Write-Host "`n--- DISCOVERY SUMMARY ---" -ForegroundColor Cyan
+Write-Host "Total users scanned:        $total"                    -ForegroundColor White
+Write-Host "Eligible for SMS conversion: $($eligible.Count)"      -ForegroundColor Green
+Write-Host "Will FAIL conversion:        $($willFail.Count)"      -ForegroundColor Red
+
+if ($willFail.Count -gt 0) {
+    Write-Host "`nUsers that will FAIL:" -ForegroundColor Yellow
+    $willFail | Format-Table UserPrincipalName, DisplayName, PhoneType, FailureReason -AutoSize
+}
+
+if ($eligible.Count -gt 0) {
+    Write-Host "`nUsers eligible for conversion:" -ForegroundColor Green
+    $eligible | Format-Table UserPrincipalName, DisplayName -AutoSize
+}
+
+# --- Export full discovery report ---
+$sortedResults = $allResults | Sort-Object UserPrincipalName
+
+if ($useExcel) {
+    $redStyle    = New-ConditionalText "Not Configured" -BackgroundColor "#FFD7D7"
+    $yellowStyle = New-ConditionalText "Limited"        -BackgroundColor "#FFF3CD"
+    $greenStyle  = New-ConditionalText "Supported"      -BackgroundColor "#D4EDDA"
+    $noStyle     = New-ConditionalText "No"             -BackgroundColor "#FFD7D7"
+
+    $sortedResults | Export-Excel -Path $reportPath `
+        -WorksheetName "PhoneAuthMethods" `
+        -TableName "PhoneAuth" `
+        -TableStyle Medium6 `
+        -AutoSize `
+        -FreezeTopRow `
+        -ConditionalText $redStyle, $yellowStyle, $greenStyle, $noStyle
+} else {
+    $sortedResults | Export-Csv -Path $reportPath -NoTypeInformation
+}
+Write-Host "`nFull discovery report exported: $reportPath" -ForegroundColor Green
+
+# =============================================
+# PHASE 2 — CONVERSION (with confirmation)
+# =============================================
+if ($eligible.Count -eq 0) {
+    Write-Host "`nNo eligible users found. Nothing to convert. Exiting." -ForegroundColor Yellow
+    Disconnect-MgGraph
+    return
+}
+
+Write-Host "`n===== PHASE 2: CONVERSION =====" -ForegroundColor Cyan
+$confirm = Read-Host "Proceed with SMS default conversion for $($eligible.Count) eligible users? (Y/N)"
+
+if ($confirm -notin @("Y", "y", "Yes", "yes")) {
+    Write-Host "Conversion cancelled by user. Discovery report still saved." -ForegroundColor Yellow
+    Disconnect-MgGraph
+    return
+}
+
+$convCounter = 0
+$convTotal   = $eligible.Count
+
+foreach ($target in $eligible) {
+    $convCounter++
+    Write-Progress -Activity "Converting default sign-in to SMS" `
+                   -Status "$convCounter of $convTotal — $($target.UserPrincipalName)" `
+                   -PercentComplete (($convCounter / $convTotal) * 100)
+
+    try {
+        $body = @{
+            userPreferredMethodForSecondaryAuthentication = "sms"
+        } | ConvertTo-Json
+
+        Invoke-MgGraphRequest -Method PATCH `
+            -Uri "https://graph.microsoft.com/beta/users/$($target.UserId)/authentication/signInPreferences" `
+            -Body $body `
+            -ContentType "application/json"
+
+        $changeSuccess.Add([PSCustomObject]@{
+            UserPrincipalName = $target.UserPrincipalName
+            DisplayName       = $target.DisplayName
+            Status            = "Success"
+            Error             = ""
+        })
+    }
+    catch {
+        $changeFailure.Add([PSCustomObject]@{
+            UserPrincipalName = $target.UserPrincipalName
+            DisplayName       = $target.DisplayName
+            Status            = "Failed"
+            Error             = $_.Exception.Message
+        })
+    }
+}
+Write-Progress -Activity "Converting default sign-in to SMS" -Completed
+
+# --- Phase 2 Summary ---
+Write-Host "`n--- CONVERSION SUMMARY ---" -ForegroundColor Cyan
+Write-Host "Successfully converted: $($changeSuccess.Count)" -ForegroundColor Green
+Write-Host "Failed during conversion: $($changeFailure.Count)" -ForegroundColor Red
+
+# --- Export failure report (discovery failures + conversion failures combined) ---
+$allFailures = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($f in $willFail) {
+    $allFailures.Add([PSCustomObject]@{
+        UserPrincipalName = $f.UserPrincipalName
+        DisplayName       = $f.DisplayName
+        FailureStage      = "Discovery — Not Eligible"
+        Reason            = $f.FailureReason
+    })
+}
+foreach ($f in $changeFailure) {
+    $allFailures.Add([PSCustomObject]@{
+        UserPrincipalName = $f.UserPrincipalName
+        DisplayName       = $f.DisplayName
+        FailureStage      = "Conversion — Runtime Error"
+        Reason            = $f.Error
+    })
+}
+
+if ($allFailures.Count -gt 0) {
+    if ($useExcel) {
+        $allFailures | Export-Excel -Path $failurePath `
+            -WorksheetName "Failures" `
+            -TableName "FailedUsers" `
+            -TableStyle Medium6 `
+            -AutoSize `
+            -FreezeTopRow
+    } else {
+        $allFailures | Export-Csv -Path $failurePath -NoTypeInformation
+    }
+    Write-Host "`nFailure report exported: $failurePath" -ForegroundColor Yellow
+}
+
+if ($changeSuccess.Count -gt 0) {
+    Write-Host "`nSuccessfully converted users:" -ForegroundColor Green
+    $changeSuccess | Format-Table UserPrincipalName, DisplayName, Status -AutoSize
+}
+
+if ($changeFailure.Count -gt 0) {
+    Write-Host "`nFailed conversion users:" -ForegroundColor Red
+    $changeFailure | Format-Table UserPrincipalName, DisplayName, Error -AutoSize
+}
+
+Disconnect-MgGraph
+Write-Host "`nDone." -ForegroundColor Cyan
