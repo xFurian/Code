@@ -1,0 +1,28 @@
+#Requires -Modules Microsoft.Graph.Users
+
+# Connect with read permissions
+Connect-MgGraph -Scopes "User.Read.All"
+
+# Pull all users with Member type but external identity (#EXT# in UPN)
+$externalMembers = Get-MgUser -Filter "userType eq 'Member'" `
+    -Property "id,displayName,userPrincipalName,mail,creationType,externalUserState" -All |
+    Where-Object { $_.UserPrincipalName -like "*#EXT#*" }
+
+# Build export with a blank NewUPN column for admin input
+$export = $externalMembers | Select-Object `
+    Id,
+    DisplayName,
+    UserPrincipalName,
+    Mail,
+    CreationType,
+    ExternalUserState,
+    @{Name='NewUPN'; Expression={''}}
+
+# Export
+$outputPath = "C:\Temp\ExternalMembers_ToConvert.csv"
+$export | Export-Csv -Path $outputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host "Exported $($export.Count) external members to $outputPath" -ForegroundColor Cyan
+Write-Host "ACTION REQUIRED: Open the CSV in Excel and populate the 'NewUPN' column for each user you want to convert." -ForegroundColor Yellow
+
+Disconnect-MgGraph
