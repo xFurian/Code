@@ -1,0 +1,60 @@
+#Requires -Modules Microsoft.Graph.Users
+
+# Connect with write permissions
+Connect-MgGraph -Scopes "User.ReadWrite.All"
+
+$inputPath  = "C:\Temp\ExternalMembers_ToConvert.csv"
+$logPath    = "C:\Temp\ConversionResults_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$users      = Import-Csv -Path $inputPath
+$results    = @()
+
+foreach ($user in $users) {
+
+    # Skip rows where NewUPN is blank
+    if ([string]::IsNullOrWhiteSpace($user.NewUPN)) {
+        Write-Host "SKIPPED (no NewUPN): $($user.DisplayName)" -ForegroundColor DarkGray
+        continue
+    }
+
+    $body = @{
+        userPrincipalName = $user.NewUPN
+    }
+
+    try {
+        $response = Invoke-MgGraphRequest -Method POST `
+            -Uri "https://graph.microsoft.com/v1.0/users/$($user.Id)/convertExternalToInternalMemberUser" `
+            -Body ($body | ConvertTo-Json) `
+            -ContentType "application/json"
+
+        Write-Host "CONVERTED: $($user.DisplayName) -> $($user.NewUPN)" -ForegroundColor Green
+
+        $results += [PSCustomObject]@{
+            DisplayName    = $user.DisplayName
+            OldUPN         = $user.UserPrincipalName
+            NewUPN         = $user.NewUPN
+            Status         = "Success"
+            Error          = ""
+            Timestamp      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        }
+    }
+    catch {
+        $errorMsg = $_.Exception.Message
+        Write-Host "FAILED: $($user.DisplayName) - $errorMsg" -ForegroundColor Red
+
+        $results += [PSCustomObject]@{
+            DisplayName    = $user.DisplayName
+            OldUPN         = $user.UserPrincipalName
+            NewUPN         = $user.NewUPN
+            Status         = "Failed"
+            Error          = $errorMsg
+            Timestamp      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        }
+    }
+}
+
+# Export results log
+$results | Export-Csv -Path $logPath -NoTypeInformation -Encoding UTF8
+Write-Host "`nConversion complete. Results log: $logPath" -ForegroundColor Cyan
+Write-Host "Success: $(($results | Where-Object Status -eq 'Success').Count) | Failed: $(($results | Where-Object Status -eq 'Failed').Count)" -ForegroundColor Cyan
+
+Disconnect-MgGraph
