@@ -10,6 +10,8 @@ loss of business information, or other pecuniary loss) arising out of the use of
 documentation, even if Microsoft has been advised of the possibility of such damages.
 #>
 
+# The purpose of this script is to convert users from external to Internal based on an Excel Output
+
 #Requires -Modules Microsoft.Graph.Users
 
 # Connect with write permissions
