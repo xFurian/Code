@@ -5,13 +5,18 @@ The sample scripts are provided AS IS without warranty of any kind. Microsoft fu
 including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
 The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
 In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts
+be liable for any damages whatsoever (including, without limitation, any implied warranties
+including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
+The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts
 be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
 loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
 documentation, even if Microsoft has been advised of the possibility of such damages.
 #>
+
 # =========================================
-# Combined: Phone Auth Discovery + SMS Default Sign-In Conversion
-# Phase 1: Discover & categorize all users
+# Phone Auth Discovery + SMS Default Sign-In Conversion
+# Phase 1: Discover & categorize all users (ACTIVE ONLY) + detect phone number collisions
 # Phase 2: Convert eligible users, export failures
 # Requires: Microsoft.Graph modules + ImportExcel (optional, falls back to CSV)
 # =========================================
@@ -45,19 +50,50 @@ $willFail        = [System.Collections.Generic.List[PSCustomObject]]::new()  # W
 $changeSuccess   = [System.Collections.Generic.List[PSCustomObject]]::new()
 $changeFailure   = [System.Collections.Generic.List[PSCustomObject]]::new()
 
+# --- Collision tracking (SMS-capable numbers across ACTIVE users) ---
+$smsNumberToUsers = @{}   # key = normalized phone number, value = List[PSCustomObject]{UPN, DisplayName, UserId}
+$collisionReport  = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+function Normalize-PhoneNumber {
+    param([string]$Number)
+
+    if ([string]::IsNullOrWhiteSpace($Number)) { return $null }
+
+    $n = $Number.Trim()
+    $hasPlus = $n.StartsWith('+')
+
+    # strip everything except digits
+    $digits = ($n -replace '[^\d]', '')
+    if ([string]::IsNullOrWhiteSpace($digits)) { return $null }
+
+    if ($hasPlus) { return "+$digits" }
+    return $digits
+}
+
 # =============================================
-# PHASE 1 — DISCOVERY
+# PHASE 1 — DISCOVERY (ACTIVE ONLY)
 # =============================================
 Write-Host "`n===== PHASE 1: DISCOVERY =====" -ForegroundColor Cyan
 Write-Host "Retrieving all users..." -ForegroundColor Cyan
 
-$users   = Get-MgUser -All -Property Id, DisplayName, UserPrincipalName, OfficeLocation, JobTitle, Department
+$allUsers = Get-MgUser -All -Property Id, DisplayName, UserPrincipalName, OfficeLocation, JobTitle, Department, AccountEnabled
+
+$activeUsers   = $allUsers | Where-Object { $_.AccountEnabled -eq $true }
+$disabledUsers = $allUsers | Where-Object { $_.AccountEnabled -ne $true }
+
+Write-Host "`n--- ACCOUNT STATUS ---" -ForegroundColor Cyan
+Write-Host "Total users in tenant:  $($allUsers.Count)"       -ForegroundColor White
+Write-Host "Active (enabled):       $($activeUsers.Count)"   -ForegroundColor Green
+Write-Host "Disabled (skipped):     $($disabledUsers.Count)" -ForegroundColor Yellow
+Write-Host "Processing ACTIVE accounts only.`n"              -ForegroundColor Cyan
+
+$users   = $activeUsers
 $total   = $users.Count
 $counter = 0
 
 foreach ($user in $users) {
     $counter++
-    Write-Progress -Activity "Discovering phone auth methods" `
+    Write-Progress -Activity "Discovering phone auth methods (ACTIVE users)" `
                    -Status "$counter of $total — $($user.UserPrincipalName)" `
                    -PercentComplete (($counter / $total) * 100)
 
@@ -67,27 +103,51 @@ foreach ($user in $users) {
         if (-not $phoneMethods) {
             # No phone methods registered at all
             $entry = [PSCustomObject]@{
-                UserPrincipalName  = $user.UserPrincipalName
-                DisplayName        = $user.DisplayName
-                Department         = $user.Department
-                JobTitle           = $user.JobTitle
-                PhoneType          = "None"
-                PhoneNumber        = "N/A"
-                SMSCapable         = "No"
-                VoiceCapable       = "No"
-                OfficePhonePresent = "No"
-                MobilePhonePresent = "No"
-                RegisteredMethod   = "None Registered"
-                SupportStatus      = "Not Configured"
-                ConversionEligible = "No"
-                FailureReason      = "No phone authentication method registered"
+                UserPrincipalName      = $user.UserPrincipalName
+                DisplayName            = $user.DisplayName
+                Department             = $user.Department
+                JobTitle               = $user.JobTitle
+                AccountEnabled         = $user.AccountEnabled
+                PhoneType              = "None"
+                PhoneNumber            = "N/A"
+                SMSCapable             = "No"
+                VoiceCapable           = "No"
+                OfficePhonePresent     = "No"
+                MobilePhonePresent     = "No"
+                RegisteredMethod       = "None Registered"
+                SupportStatus          = "Not Configured"
+                ConversionEligible     = "No"
+                FailureReason          = "No phone authentication method registered"
+                Collision              = "No"
+                CollisionPhoneNumber   = ""
             }
             $allResults.Add($entry)
             $willFail.Add($entry)
             continue
         }
 
-        # Check if this user has at least one mobile/alternateMobile method (SMS-capable)
+        # Track SMS-capable numbers for collision detection (mobile/alternateMobile only)
+        $smsCapableMethods = $phoneMethods | Where-Object { $_.PhoneType -in @("mobile","alternateMobile") }
+
+        foreach ($pm in $smsCapableMethods) {
+            $norm = Normalize-PhoneNumber $pm.PhoneNumber
+            if (-not $norm) { continue }
+
+            if (-not $smsNumberToUsers.ContainsKey($norm)) {
+                $smsNumberToUsers[$norm] = [System.Collections.Generic.List[object]]::new()
+            }
+
+            # Deduplicate per number/user
+            if (-not ($smsNumberToUsers[$norm] | Where-Object { $_.UserPrincipalName -eq $user.UserPrincipalName })) {
+                $smsNumberToUsers[$norm].Add([PSCustomObject]@{
+                    UserPrincipalName = $user.UserPrincipalName
+                    DisplayName       = $user.DisplayName
+                    UserId            = $user.Id
+                })
+            }
+        }
+
+        # Determine if this user has at least one SMS-capable (mobile/alternateMobile) method
         $hasMobile = $phoneMethods | Where-Object { $_.PhoneType -in @("mobile", "alternateMobile") }
 
         foreach ($method in $phoneMethods) {
@@ -103,25 +163,30 @@ foreach ($user in $users) {
                 default           { "Unknown" }
             }
 
-            # Eligibility is per-user (not per-method): user needs at least one mobile method
-            $isEligible   = [bool]$hasMobile
-            $failReason   = if (-not $isEligible) { "No mobile phone method — voice/office only" } else { "" }
+            # Eligibility is per-user (not per-method): user needs at least one mobile/altMobile method
+            $isEligible = [bool]$hasMobile
+            $failReason = if (-not $isEligible) { "No mobile phone method — voice/office only" } else { "" }
 
             $entry = [PSCustomObject]@{
-                UserPrincipalName  = $user.UserPrincipalName
-                DisplayName        = $user.DisplayName
-                Department         = $user.Department
-                JobTitle           = $user.JobTitle
-                PhoneType          = $phoneType
-                PhoneNumber        = $method.PhoneNumber
-                SMSCapable         = if ($smsCapable)   { "Yes" } else { "No" }
-                VoiceCapable       = "Yes"
-                OfficePhonePresent = if ($phoneType -eq "office") { "Yes" } else { "No" }
-                MobilePhonePresent = if ($phoneType -in @("mobile","alternateMobile")) { "Yes" } else { "No" }
-                RegisteredMethod   = $registeredMethod
-                SupportStatus      = $supportStatus
-                ConversionEligible = if ($isEligible) { "Yes" } else { "No" }
-                FailureReason      = $failReason
+                UserPrincipalName      = $user.UserPrincipalName
+                DisplayName            = $user.DisplayName
+                Department             = $user.Department
+                JobTitle               = $user.JobTitle
+                AccountEnabled         = $user.AccountEnabled
+                PhoneType              = $phoneType
+                PhoneNumber            = $method.PhoneNumber
+                SMSCapable             = if ($smsCapable) { "Yes" } else { "No" }
+                VoiceCapable           = "Yes"
+                OfficePhonePresent     = if ($phoneType -eq "office") { "Yes" } else { "No" }
+                MobilePhonePresent     = if ($phoneType -in @("mobile","alternateMobile")) { "Yes" } else { "No" }
+                RegisteredMethod       = $registeredMethod
+                SupportStatus          = $supportStatus
+                ConversionEligible     = if ($isEligible) { "Yes" } else { "No" }
+                FailureReason          = $failReason
+
+                # Collision fields are populated after all users are processed
+                Collision              = "No"
+                CollisionPhoneNumber   = ""
             }
             $allResults.Add($entry)
         }
@@ -143,32 +208,92 @@ foreach ($user in $users) {
     }
     catch {
         $entry = [PSCustomObject]@{
-            UserPrincipalName  = $user.UserPrincipalName
-            DisplayName        = $user.DisplayName
-            Department         = $user.Department
-            JobTitle           = $user.JobTitle
-            PhoneType          = "ERROR"
-            PhoneNumber        = "N/A"
-            SMSCapable         = "N/A"
-            VoiceCapable       = "N/A"
-            OfficePhonePresent = "N/A"
-            MobilePhonePresent = "N/A"
-            RegisteredMethod   = "Query Failed"
-            SupportStatus      = "Error"
-            ConversionEligible = "No"
-            FailureReason      = $_.Exception.Message
+            UserPrincipalName      = $user.UserPrincipalName
+            DisplayName            = $user.DisplayName
+            Department             = $user.Department
+            JobTitle               = $user.JobTitle
+            AccountEnabled         = $user.AccountEnabled
+            PhoneType              = "ERROR"
+            PhoneNumber            = "N/A"
+            SMSCapable             = "N/A"
+            VoiceCapable           = "N/A"
+            OfficePhonePresent     = "N/A"
+            MobilePhonePresent     = "N/A"
+            RegisteredMethod       = "Query Failed"
+            SupportStatus          = "Error"
+            ConversionEligible     = "No"
+            FailureReason          = $_.Exception.Message
+            Collision              = "N/A"
+            CollisionPhoneNumber   = ""
         }
         $allResults.Add($entry)
         $willFail.Add($entry)
     }
 }
-Write-Progress -Activity "Discovering phone auth methods" -Completed
+Write-Progress -Activity "Discovering phone auth methods (ACTIVE users)" -Completed
+
+# --- Collision computation (after discovery) ---
+$collisionNumbers = $smsNumberToUsers.Keys | Where-Object { $smsNumberToUsers[$_].Count -gt 1 }
+
+$distinctSmsNumbers   = $smsNumberToUsers.Keys.Count
+$collisionNumberCount = $collisionNumbers.Count
+$collisionUserCount   = (
+    $collisionNumbers |
+    ForEach-Object { $smsNumberToUsers[$_].UserPrincipalName } |
+    Select-Object -Unique
+).Count
+
+# Build a collision report (one row per duplicated phone number)
+foreach ($num in $collisionNumbers) {
+    $usersForNum = $smsNumberToUsers[$num]
+    $collisionReport.Add([PSCustomObject]@{
+        CollisionPhoneNumber = $num
+        UserCount            = $usersForNum.Count
+        Users                = ($usersForNum | ForEach-Object { "$($_.UserPrincipalName) ($($_.DisplayName))" }) -join "; "
+    })
+}
+
+# Build a set of UPNs impacted by collision (active users)
+$collisionUserSet = New-Object System.Collections.Generic.HashSet[string]
+foreach ($num in $collisionNumbers) {
+    foreach ($u in $smsNumberToUsers[$num]) {
+        [void]$collisionUserSet.Add($u.UserPrincipalName)
+    }
+}
+
+# Apply collision flags to each report row
+foreach ($row in $allResults) {
+    $isCollisionUser = $collisionUserSet.Contains($row.UserPrincipalName)
+
+    $row.Collision = if ($isCollisionUser) { "Yes" } else { "No" }
+
+    if ($row.SMSCapable -eq "Yes") {
+        $normRow = Normalize-PhoneNumber $row.PhoneNumber
+        if ($normRow -and ($collisionNumbers -contains $normRow)) {
+            $row.CollisionPhoneNumber = $normRow
+        } else {
+            $row.CollisionPhoneNumber = ""
+        }
+    } else {
+        $row.CollisionPhoneNumber = ""
+    }
+}
 
 # --- Phase 1 Summary ---
 Write-Host "`n--- DISCOVERY SUMMARY ---" -ForegroundColor Cyan
-Write-Host "Total users scanned:        $total"                    -ForegroundColor White
-Write-Host "Eligible for SMS conversion: $($eligible.Count)"      -ForegroundColor Green
-Write-Host "Will FAIL conversion:        $($willFail.Count)"      -ForegroundColor Red
+Write-Host "Total users in tenant:            $($allUsers.Count)"      -ForegroundColor White
+Write-Host "Active accounts scanned:          $($activeUsers.Count)"   -ForegroundColor White
+Write-Host "Disabled accounts (skipped):      $($disabledUsers.Count)" -ForegroundColor DarkGray
+Write-Host "Eligible for SMS conversion:      $($eligible.Count)"      -ForegroundColor Green
+Write-Host "Will FAIL conversion:             $($willFail.Count)"      -ForegroundColor Red
+Write-Host "Distinct SMS-capable numbers:     $distinctSmsNumbers"     -ForegroundColor White
+Write-Host "Collision phone numbers:          $collisionNumberCount"   -ForegroundColor Magenta
+Write-Host "Users impacted by collisions:     $collisionUserCount"     -ForegroundColor Magenta
+
+if ($collisionReport.Count -gt 0) {
+    Write-Host "`n--- COLLISIONS (duplicate SMS-capable phone numbers) ---" -ForegroundColor Magenta
+    $collisionReport | Sort-Object UserCount -Descending | Format-Table CollisionPhoneNumber, UserCount, Users -AutoSize
+}
 
 if ($willFail.Count -gt 0) {
     Write-Host "`nUsers that will FAIL:" -ForegroundColor Yellow
@@ -184,10 +309,11 @@ if ($eligible.Count -gt 0) {
 $sortedResults = $allResults | Sort-Object UserPrincipalName
 
 if ($useExcel) {
-    $redStyle    = New-ConditionalText "Not Configured" -BackgroundColor "#FFD7D7"
-    $yellowStyle = New-ConditionalText "Limited"        -BackgroundColor "#FFF3CD"
-    $greenStyle  = New-ConditionalText "Supported"      -BackgroundColor "#D4EDDA"
-    $noStyle     = New-ConditionalText "No"             -BackgroundColor "#FFD7D7"
+    $redStyle        = New-ConditionalText "Not Configured" -BackgroundColor "#FFD7D7"
+    $yellowStyle     = New-ConditionalText "Limited"        -BackgroundColor "#FFF3CD"
+    $greenStyle      = New-ConditionalText "Supported"      -BackgroundColor "#D4EDDA"
+    $noStyle         = New-ConditionalText "No"             -BackgroundColor "#FFD7D7"
+    $collisionStyle  = New-ConditionalText "Yes"            -BackgroundColor "#F8D7DA" -ConditionalTextColor "#721C24"
 
     $sortedResults | Export-Excel -Path $reportPath `
         -WorksheetName "PhoneAuthMethods" `
@@ -195,9 +321,26 @@ if ($useExcel) {
         -TableStyle Medium6 `
         -AutoSize `
         -FreezeTopRow `
-        -ConditionalText $redStyle, $yellowStyle, $greenStyle, $noStyle
+        -ConditionalText $redStyle, $yellowStyle, $greenStyle, $noStyle, $collisionStyle
+
+    # Export collisions worksheet
+    if ($collisionReport.Count -gt 0) {
+        $collisionReport | Export-Excel -Path $reportPath `
+            -WorksheetName "Collisions" `
+            -TableName "SMSPhoneCollisions" `
+            -TableStyle Medium6 `
+            -AutoSize `
+            -FreezeTopRow `
+            -Append
+    }
 } else {
     $sortedResults | Export-Csv -Path $reportPath -NoTypeInformation
+
+    if ($collisionReport.Count -gt 0) {
+        $collisionPath = $reportPath -replace '\.csv$', '_Collisions.csv'
+        $collisionReport | Export-Csv -Path $collisionPath -NoTypeInformation
+        Write-Host "Collision report exported: $collisionPath" -ForegroundColor Magenta
+    }
 }
 Write-Host "`nFull discovery report exported: $reportPath" -ForegroundColor Green
 
@@ -258,7 +401,7 @@ Write-Progress -Activity "Converting default sign-in to SMS" -Completed
 
 # --- Phase 2 Summary ---
 Write-Host "`n--- CONVERSION SUMMARY ---" -ForegroundColor Cyan
-Write-Host "Successfully converted: $($changeSuccess.Count)" -ForegroundColor Green
+Write-Host "Successfully converted:  $($changeSuccess.Count)" -ForegroundColor Green
 Write-Host "Failed during conversion: $($changeFailure.Count)" -ForegroundColor Red
 
 # --- Export failure report (discovery failures + conversion failures combined) ---
@@ -307,3 +450,4 @@ if ($changeFailure.Count -gt 0) {
 
 Disconnect-MgGraph
 Write-Host "`nDone." -ForegroundColor Cyan
+``
