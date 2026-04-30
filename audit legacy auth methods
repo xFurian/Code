@@ -1,30 +1,16 @@
 <#
-Disclaimer
-The sample scripts are not supported under any Microsoft standard support program or service.
-The sample scripts are provided AS IS without warranty of any kind. Microsoft further disclaims all implied warranties
-including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
-The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
-In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts
-be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
-loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
-documentation, even if Microsoft has been advised of the possibility of such damages.
+.SYNOPSIS
+    Audits legacy authentication usage from Entra ID sign-in logs.
+.DESCRIPTION
+    Pulls interactive and non-interactive sign-in logs filtered to legacy
+    authentication client app types via direct Graph REST calls.
+.NOTES
+    Requires: Microsoft Entra ID P1+ (for sign-in logs access)
+    Permissions: AuditLog.Read.All, Directory.Read.All
+    Module: Microsoft.Graph.Authentication
 #>
 
-<#
-    .SYNOPSIS
-        Audits legacy authentication usage from Entra ID sign-in logs.
-    .DESCRIPTION
-        Pulls interactive and non-interactive sign-in logs filtered to legacy
-        authentication client app types via direct Graph REST calls.
-        Outputs a summary grouped by legacy auth protocol and the resources
-        each protocol is used against, then exports raw detail to CSV.
-    .NOTES
-        Requires: Microsoft Entra ID P1+
-        Permissions: AuditLog.Read.All, Directory.Read.All
-        Module: Microsoft.Graph.Authentication (latest version recommended)
-#>
-
-# ── Disable WAM BEFORE module loads ────────────────────────────────────────────
+# Disable WAM BEFORE module loads
 $env:MSAL_ENABLE_WAM = "0"
 
 try {
@@ -35,7 +21,7 @@ try {
     return
 }
 
-# ── Configuration ──────────────────────────────────────────────────────────────
+# Configuration
 $DaysBack   = 30
 $ExportPath = "$env:USERPROFILE\Desktop\LegacyAuthAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 
@@ -55,7 +41,7 @@ $LegacyClientApps = @(
     "Authenticated SMTP"
 )
 
-# ── Connect ────────────────────────────────────────────────────────────────────
+# Connect
 Write-Host "`n[*] Connecting to Microsoft Graph..." -ForegroundColor Cyan
 
 try {
@@ -79,78 +65,100 @@ if (-not $Context) {
 Write-Host "[✓] Connected as: $($Context.Account)" -ForegroundColor Green
 Write-Host "    Scopes: $($Context.Scopes -join ', ')" -ForegroundColor Gray
 
-# ── Validate token ─────────────────────────────────────────────────────────────
+# Validate token
 Write-Host "[*] Validating Graph session..." -ForegroundColor Cyan
-
 try {
-    $TestCall = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/me" -OutputType PSObject -ErrorAction Stop
-    Write-Host "[✓] Token validated: $($TestCall.displayName)`n" -ForegroundColor Green
+    $null = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/me" -OutputType PSObject -ErrorAction Stop
+    Write-Host "[✓] Token validated.`n" -ForegroundColor Green
 } catch {
     Write-Error "Token validation failed: $($_.Exception.Message)"
-    Write-Host "    Run: Install-Module Microsoft.Graph.Authentication -Force -AllowClobber -Scope CurrentUser" -ForegroundColor Yellow
     return
 }
 
-# ── Helper function: paginated Graph GET with progress ─────────────────────────
+# Helper: paginated Graph GET with progress + loop hardening
 function Get-AllGraphResults {
-    param (
-        [string]$Uri,
-        [string]$Label = "records"
+    param(
+        [Parameter(Mandatory)] [string] $Uri,
+        [string] $Label = "records",
+        [int] $MaxPages = 0  # 0 = unlimited; set e.g. 5000 if you want a hard cap
     )
 
-    $Results = @()
+    $Results   = New-Object System.Collections.Generic.List[object]
     $PageCount = 0
+    $SeenNext  = New-Object 'System.Collections.Generic.HashSet[string]'
 
     try {
         $Response = Invoke-MgGraphRequest -Method GET -Uri $Uri -OutputType PSObject -ErrorAction Stop
-        if ($Response.value) {
-            $Results += @($Response.value)
+
+        while ($true) {
             $PageCount++
-            Write-Host "    Page $PageCount retrieved ($($Results.Count) $Label so far)..." -ForegroundColor DarkGray
+
+            if ($Response.value) {
+                foreach ($item in $Response.value) { [void]$Results.Add($item) }
+            }
+
+            # Indeterminate progress bar (no total page count)
+            Write-Progress -Activity "Retrieving $Label from Microsoft Graph" `
+                           -Status  ("Pages: {0} | Items: {1}" -f $PageCount, $Results.Count) `
+                           -PercentComplete -1
+
+            # Safety: optional max pages
+            if ($MaxPages -gt 0 -and $PageCount -ge $MaxPages) {
+                Write-Warning "MaxPages ($MaxPages) reached. Stopping pagination early."
+                break
+            }
+
+            $NextLink = $Response.'@odata.nextLink'
+            if (-not $NextLink) { break }
+
+            # Safety: break if nextLink repeats (prevents true infinite loop)
+            if (-not $SeenNext.Add($NextLink)) {
+                Write-Warning "Detected repeating @odata.nextLink. Stopping to prevent infinite loop."
+                break
+            }
+
+            $Response = Invoke-MgGraphRequest -Method GET -Uri $NextLink -OutputType PSObject -ErrorAction Stop
         }
 
-        while ($Response.'@odata.nextLink') {
-            $Response = Invoke-MgGraphRequest -Method GET -Uri $Response.'@odata.nextLink' -OutputType PSObject -ErrorAction Stop
-            if ($Response.value) {
-                $Results += @($Response.value)
-                $PageCount++
-                Write-Host "    Page $PageCount retrieved ($($Results.Count) $Label so far)..." -ForegroundColor DarkGray
-            }
-        }
+        Write-Progress -Activity "Retrieving $Label from Microsoft Graph" -Completed
+
     } catch {
+        Write-Progress -Activity "Retrieving $Label from Microsoft Graph" -Completed
         Write-Warning "Graph request failed: $($_.Exception.Message)"
     }
 
     return $Results
 }
 
-# ── Build filter ───────────────────────────────────────────────────────────────
-$FilterDate = (Get-Date).AddDays(-$DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
+# Build filter date
+$FilterDate = (Get-Date).AddDays(-$DaysBack).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-# ── Pull interactive sign-in logs (v1.0 — returns interactive by default) ──────
+# Optional: reduce payload size for faster paging
+$Select = "createdDateTime,userDisplayName,userPrincipalName,clientAppUsed,resourceDisplayName,resourceId,appDisplayName,ipAddress,status"
+
+# Pull interactive sign-ins (v1.0)
 Write-Host "[*] Pulling interactive sign-in logs ($DaysBack days)..." -ForegroundColor Cyan
+$InteractiveFilter = "createdDateTime ge $FilterDate"
+$InteractiveUri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=$([uri]::EscapeDataString($InteractiveFilter))&`$select=$Select&`$top=999"
 
-$InteractiveUri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=createdDateTime ge $FilterDate&`$top=999"
 $InteractiveLogs = Get-AllGraphResults -Uri $InteractiveUri -Label "interactive events"
-
 Write-Host "    Total: $($InteractiveLogs.Count) interactive sign-in events." -ForegroundColor Gray
 
-# ── Pull non-interactive sign-in logs (beta — signInEventTypes required) ───────
+# Pull non-interactive sign-ins (beta) - subject to change in /beta
 Write-Host "[*] Pulling non-interactive sign-in logs ($DaysBack days)..." -ForegroundColor Cyan
+$NonInteractiveFilter = "createdDateTime ge $FilterDate and signInEventTypes/any(t: t eq 'nonInteractiveUser')"
+$NonInteractiveUri = "https://graph.microsoft.com/beta/auditLogs/signIns?`$filter=$([uri]::EscapeDataString($NonInteractiveFilter))&`$select=$Select&`$top=999"
 
-$NonInteractiveUri = "https://graph.microsoft.com/beta/auditLogs/signIns?`$filter=createdDateTime ge $FilterDate and signInEventTypes/any(t: t eq 'nonInteractiveUser')&`$top=999"
 $NonInteractiveLogs = Get-AllGraphResults -Uri $NonInteractiveUri -Label "non-interactive events"
-
 Write-Host "    Total: $($NonInteractiveLogs.Count) non-interactive sign-in events." -ForegroundColor Gray
 
-# ── Filter to legacy auth ──────────────────────────────────────────────────────
+# Filter to legacy auth
 Write-Host "`n[*] Filtering to legacy authentication events..." -ForegroundColor Cyan
-
-$AllSignIns = @()
+$AllSignIns = New-Object System.Collections.Generic.List[object]
 
 foreach ($log in $InteractiveLogs) {
-    if ($log.clientAppUsed -and $LegacyClientApps -contains $log.clientAppUsed) {
-        $AllSignIns += [PSCustomObject]@{
+    if ($log.clientAppUsed -and ($LegacyClientApps -contains $log.clientAppUsed)) {
+        [void]$AllSignIns.Add([PSCustomObject]@{
             SignInType          = "Interactive"
             UserDisplayName     = $log.userDisplayName
             UserPrincipalName   = $log.userPrincipalName
@@ -161,13 +169,13 @@ foreach ($log in $InteractiveLogs) {
             IPAddress           = $log.ipAddress
             Status              = $log.status.errorCode
             CreatedDateTime     = $log.createdDateTime
-        }
+        })
     }
 }
 
 foreach ($log in $NonInteractiveLogs) {
-    if ($log.clientAppUsed -and $LegacyClientApps -contains $log.clientAppUsed) {
-        $AllSignIns += [PSCustomObject]@{
+    if ($log.clientAppUsed -and ($LegacyClientApps -contains $log.clientAppUsed)) {
+        [void]$AllSignIns.Add([PSCustomObject]@{
             SignInType          = "NonInteractive"
             UserDisplayName     = $log.userDisplayName
             UserPrincipalName   = $log.userPrincipalName
@@ -178,59 +186,26 @@ foreach ($log in $NonInteractiveLogs) {
             IPAddress           = $log.ipAddress
             Status              = $log.status.errorCode
             CreatedDateTime     = $log.createdDateTime
-        }
+        })
     }
 }
 
 Write-Host "[✓] Legacy auth sign-in events found: $($AllSignIns.Count)" -ForegroundColor Yellow
 
-# ── Handle zero results ────────────────────────────────────────────────────────
+# Handle zero results
 if ($AllSignIns.Count -eq 0) {
     Write-Host "`n[✓] No legacy authentication usage detected in the last $DaysBack days." -ForegroundColor Green
-    Write-Host "    This environment may already be blocking legacy auth or no legacy clients are in use." -ForegroundColor Gray
     if (Get-MgContext) { Disconnect-MgGraph | Out-Null }
     return
 }
 
-# ── Summary: Legacy Auth by Type ───────────────────────────────────────────────
-Write-Host "`n══════════════════════════════════════════════════════════════" -ForegroundColor Green
-Write-Host "  LEGACY AUTH USAGE BY PROTOCOL TYPE" -ForegroundColor Green
-Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Green
+# Export raw detail (Export-Csv works in both Windows PowerShell 5.1 and PowerShell 7+)
+$ExportDir = Split-Path -Path $ExportPath -Parent
+if (-not (Test-Path $ExportDir)) { New-Item -ItemType Directory -Path $ExportDir | Out-Null }
 
-$ByType = $AllSignIns | Group-Object -Property ClientAppUsed | Sort-Object Count -Descending
-
-foreach ($group in $ByType) {
-    $UniqueUsers = ($group.Group | Select-Object -ExpandProperty UserPrincipalName -Unique).Count
-    Write-Host "`n  Protocol : $($group.Name)" -ForegroundColor White
-    Write-Host "  Events   : $($group.Count)" -ForegroundColor Gray
-    Write-Host "  Users    : $UniqueUsers" -ForegroundColor Gray
-}
-
-# ── Summary: Resources per Legacy Auth Type ────────────────────────────────────
-Write-Host "`n══════════════════════════════════════════════════════════════" -ForegroundColor Green
-Write-Host "  RESOURCES UTILIZING LEGACY AUTH (BY PROTOCOL)" -ForegroundColor Green
-Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Green
-
-foreach ($group in $ByType) {
-    Write-Host "`n  ┌─ $($group.Name)" -ForegroundColor Cyan
-    $Resources = $group.Group | Group-Object -Property ResourceDisplayName | Sort-Object Count -Descending
-    foreach ($resource in $Resources) {
-        $UniqueUsers = ($resource.Group | Select-Object -ExpandProperty UserPrincipalName -Unique).Count
-        Write-Host "  │   Resource : $($resource.Name)" -ForegroundColor White
-        Write-Host "  │   Events   : $($resource.Count)  |  Unique Users: $UniqueUsers" -ForegroundColor Gray
-    }
-    Write-Host "  └──────────────────────────────────────────────" -ForegroundColor DarkGray
-}
-
-# ── Export raw detail ──────────────────────────────────────────────────────────
-if ($PSVersionTable.PSVersion.Major -ge 7) {
-    $AllSignIns | Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8NoBOM
-} else {
-    $AllSignIns | ConvertTo-Csv -NoTypeInformation | Out-File -FilePath $ExportPath -Encoding ASCII
-}
+$AllSignIns | Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
 
 Write-Host "`n[✓] Raw detail exported to: $ExportPath" -ForegroundColor Green
 
-# ── Disconnect ─────────────────────────────────────────────────────────────────
 if (Get-MgContext) { Disconnect-MgGraph | Out-Null }
 Write-Host "[✓] Complete.`n" -ForegroundColor Green
