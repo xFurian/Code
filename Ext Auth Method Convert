@@ -108,10 +108,10 @@ Write-Host "`n===== PHASE 0: DISCOVER EXTERNAL AUTH METHODS =====" -ForegroundCo
 
 try {
     $policyResponse = Invoke-MgGraphRequest -Method GET `
-        -Uri "https://graph.microsoft.com/beta/policies/authenticationMethodsPolicy/authenticationMethodConfigurations" `
+        -Uri "https://graph.microsoft.com/beta/policies/authenticationMethodsPolicy" `
         -ErrorAction Stop
 
-    $externalConfigs = $policyResponse.value | Where-Object {
+    $externalConfigs = $policyResponse.authenticationMethodConfigurations | Where-Object {
         $_.'@odata.type' -like '*externalAuthenticationMethodConfiguration*'
     }
 
