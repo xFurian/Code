@@ -1,0 +1,533 @@
+#This code is untested
+<#
+Disclaimer
+The sample scripts are not supported under any Microsoft standard support program or service.
+The sample scripts are provided AS IS without warranty of any kind. Microsoft further disclaims all implied warranties
+including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
+The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts
+be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
+loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
+documentation, even if Microsoft has been advised of the possibility of such damages.
+#>
+
+# =========================================
+# Authentication Method Discovery + External MFA Provider Default Sign-In Conversion
+# Phase 0: Discover & select External Authentication Method (EAM) from tenant config
+# Phase 1: Discover & categorize ALL registered auth methods for ACTIVE users
+# Phase 2: Convert eligible users' preferred secondary auth method to EAM
+# Requires: Microsoft.Graph modules + ImportExcel (optional, falls back to CSV)
+# =========================================
+
+Import-Module Microsoft.Graph.Identity.SignIns
+Import-Module Microsoft.Graph.Users.Actions
+
+# --- Single connection with all required scopes ---
+Connect-MgGraph -Scopes @(
+    "UserAuthenticationMethod.Read.All",
+    "UserAuthenticationMethod.ReadWrite.All",
+    "User.Read.All",
+    "Policy.Read.All"
+)
+
+# --- Output paths ---
+$timestamp       = Get-Date -Format 'yyyyMMdd_HHmm'
+$reportPath      = "C:\AuthMethod_FullReport_$timestamp.xlsx"
+$failurePath     = "C:\AuthMethod_Failures_$timestamp.xlsx"
+$useExcel        = $null -ne (Get-Module -ListAvailable -Name ImportExcel)
+
+if (-not $useExcel) {
+    Write-Host "ImportExcel module not found. Output will fall back to CSV." -ForegroundColor Yellow
+    $reportPath  = $reportPath  -replace '\.xlsx$', '.csv'
+    $failurePath = $failurePath -replace '\.xlsx$', '.csv'
+}
+
+# --- Collections ---
+$allResults      = [System.Collections.Generic.List[PSCustomObject]]::new()
+$eligible        = [System.Collections.Generic.List[PSCustomObject]]::new()
+$willFail        = [System.Collections.Generic.List[PSCustomObject]]::new()
+$changeSuccess   = [System.Collections.Generic.List[PSCustomObject]]::new()
+$changeFailure   = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+# --- Method distribution tracker ---
+$methodDistribution = @{}
+
+# --- Helper: classify @odata.type to friendly category ---
+function Get-MethodCategory {
+    param([string]$ODataType)
+    switch -Wildcard ($ODataType) {
+        "*phoneAuthenticationMethod"                   { return "Phone" }
+        "*microsoftAuthenticatorAuthenticationMethod"  { return "Microsoft Authenticator" }
+        "*fido2AuthenticationMethod"                   { return "FIDO2 Security Key" }
+        "*softwareOathAuthenticationMethod"            { return "Software OATH Token" }
+        "*emailAuthenticationMethod"                   { return "Email" }
+        "*windowsHelloForBusinessAuthenticationMethod" { return "Windows Hello for Business" }
+        "*temporaryAccessPassAuthenticationMethod"     { return "Temporary Access Pass" }
+        "*passwordAuthenticationMethod"                { return "Password" }
+        "*platformCredentialAuthenticationMethod"      { return "Platform Credential" }
+        default                                        { return "Unknown ($ODataType)" }
+    }
+}
+
+# --- Helper: extract human-readable detail per method ---
+function Get-MethodDetail {
+    param($Method, [string]$Category)
+    switch ($Category) {
+        "Phone" {
+            $pt = $Method.phoneType
+            $pn = $Method.phoneNumber
+            return "$pt`: $pn"
+        }
+        "Microsoft Authenticator" {
+            $dn = if ($Method.displayName) { $Method.displayName } else { "Unknown Device" }
+            return "Device: $dn | DeviceTag: $($Method.deviceTag)"
+        }
+        "FIDO2 Security Key" {
+            $model = if ($Method.model) { $Method.model } else { "Unknown" }
+            return "Model: $model | Created: $($Method.createdDateTime)"
+        }
+        "Software OATH Token" { return "OATH Token Registered" }
+        "Email"               { return "Email: $($Method.emailAddress)" }
+        "Windows Hello for Business" {
+            $dn = if ($Method.displayName) { $Method.displayName } else { "Unknown Device" }
+            return "Device: $dn | Strength: $($Method.keyStrength)"
+        }
+        "Temporary Access Pass" { return "Usable: $($Method.isUsable) | Lifetime: $($Method.lifetimeInMinutes)m" }
+        "Platform Credential" {
+            $dn = if ($Method.displayName) { $Method.displayName } else { "Unknown" }
+            return "Device: $dn | Platform: $($Method.platform)"
+        }
+        default { return $Method.'@odata.type' }
+    }
+}
+
+# =============================================
+# PHASE 0 — DISCOVER & SELECT EXTERNAL AUTH METHOD
+# =============================================
+Write-Host "`n===== PHASE 0: DISCOVER EXTERNAL AUTH METHODS =====" -ForegroundColor Cyan
+
+try {
+    $policyResponse = Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/beta/policies/authenticationMethodsPolicy/authenticationMethodConfigurations" `
+        -ErrorAction Stop
+
+    $externalConfigs = $policyResponse.value | Where-Object {
+        $_.'@odata.type' -like '*externalAuthenticationMethodConfiguration*'
+    }
+
+    if (-not $externalConfigs -or $externalConfigs.Count -eq 0) {
+        Write-Host "No External Authentication Methods configured in this tenant." -ForegroundColor Red
+        Write-Host "Configure an EAM under Entra > Protection > Authentication methods before running this script." -ForegroundColor Yellow
+        Disconnect-MgGraph
+        return
+    }
+
+    # --- Display available EAMs as numbered menu ---
+    Write-Host "`nExternal Authentication Methods found in tenant:" -ForegroundColor Green
+    $eamList = @($externalConfigs)
+    for ($i = 0; $i -lt $eamList.Count; $i++) {
+        $stateColor = if ($eamList[$i].state -eq "enabled") { "Green" } else { "Yellow" }
+        Write-Host ("  [{0}] {1}  |  App ID: {2}  |  State: {3}" -f ($i + 1), $eamList[$i].displayName, $eamList[$i].appId, $eamList[$i].state) -ForegroundColor $stateColor
+    }
+
+    # --- Prompt for selection ---
+    $selection = $null
+    while ($null -eq $selection) {
+        $input = Read-Host "`nSelect EAM by number (1-$($eamList.Count))"
+        $parsed = $input -as [int]
+        if ($parsed -ge 1 -and $parsed -le $eamList.Count) {
+            $selection = $parsed - 1
+        }
+        else {
+            Write-Host "Invalid selection. Enter a number between 1 and $($eamList.Count)." -ForegroundColor Red
+        }
+    }
+
+    $targetEAM             = $eamList[$selection]
+    $ExternalMethodAppId   = $targetEAM.appId
+    $ExternalMethodDisplay = $targetEAM.displayName
+
+    # --- Validate state ---
+    if ($targetEAM.state -ne "enabled") {
+        Write-Host "`nERROR: '$ExternalMethodDisplay' is NOT enabled (state: $($targetEAM.state))." -ForegroundColor Red
+        Write-Host "Enable the EAM in Entra admin center before running conversion." -ForegroundColor Yellow
+        Disconnect-MgGraph
+        return
+    }
+
+    Write-Host "`nTarget EAM selected: $ExternalMethodDisplay (App ID: $ExternalMethodAppId) — Enabled" -ForegroundColor Green
+}
+catch {
+    Write-Host "Failed to query authentication methods policy: $($_.Exception.Message)" -ForegroundColor Red
+    Disconnect-MgGraph
+    return
+}
+
+# =============================================
+# PHASE 1 — DISCOVERY (ACTIVE ONLY)
+# =============================================
+Write-Host "`n===== PHASE 1: DISCOVERY =====" -ForegroundColor Cyan
+Write-Host "Retrieving all users..." -ForegroundColor Cyan
+
+$allUsers = Get-MgUser -All -Property Id, DisplayName, UserPrincipalName, OfficeLocation, JobTitle, Department, AccountEnabled
+
+$activeUsers   = $allUsers | Where-Object { $_.AccountEnabled -eq $true }
+$disabledUsers = $allUsers | Where-Object { $_.AccountEnabled -ne $true }
+
+Write-Host "`n--- ACCOUNT STATUS ---" -ForegroundColor Cyan
+Write-Host "Total users in tenant:  $($allUsers.Count)"       -ForegroundColor White
+Write-Host "Active (enabled):       $($activeUsers.Count)"   -ForegroundColor Green
+Write-Host "Disabled (skipped):     $($disabledUsers.Count)" -ForegroundColor Yellow
+Write-Host "Processing ACTIVE accounts only.`n"              -ForegroundColor Cyan
+
+$users   = $activeUsers
+$total   = $users.Count
+$counter = 0
+
+foreach ($user in $users) {
+    $counter++
+    Write-Progress -Activity "Discovering authentication methods (ACTIVE users)" `
+                   -Status "$counter of $total — $($user.UserPrincipalName)" `
+                   -PercentComplete (($counter / $total) * 100)
+
+    try {
+        # --- Get ALL auth methods via beta endpoint ---
+        $authResponse = Invoke-MgGraphRequest -Method GET `
+            -Uri "https://graph.microsoft.com/beta/users/$($user.Id)/authentication/methods" `
+            -ErrorAction Stop
+
+        $allMethods = $authResponse.value
+
+        # Filter out Password (every user has it — not relevant for MFA classification)
+        $mfaMethods = $allMethods | Where-Object { $_.'@odata.type' -notlike '*passwordAuthenticationMethod' }
+
+        # --- Get current sign-in preferences ---
+        $currentPref = "Not Set"
+        $systemPref  = "Not Set"
+        try {
+            $prefResponse = Invoke-MgGraphRequest -Method GET `
+                -Uri "https://graph.microsoft.com/beta/users/$($user.Id)/authentication/signInPreferences" `
+                -ErrorAction Stop
+
+            $currentPref = if ($prefResponse.userPreferredMethodForSecondaryAuthentication) {
+                $prefResponse.userPreferredMethodForSecondaryAuthentication
+            } else { "Not Set" }
+
+            $systemPref = if ($prefResponse.systemPreferredAuthenticationMethod) {
+                $prefResponse.systemPreferredAuthenticationMethod
+            } else { "Not Set" }
+        }
+        catch { $currentPref = "Unable to retrieve"; $systemPref = "Unable to retrieve" }
+
+        # --- No MFA methods registered ---
+        if (-not $mfaMethods -or $mfaMethods.Count -eq 0) {
+            $entry = [PSCustomObject]@{
+                UserPrincipalName         = $user.UserPrincipalName
+                DisplayName               = $user.DisplayName
+                Department                = $user.Department
+                JobTitle                  = $user.JobTitle
+                AccountEnabled            = $user.AccountEnabled
+                MethodCategory            = "None"
+                MethodDetail              = "N/A"
+                MethodId                  = "N/A"
+                TotalMFAMethodsRegistered = 0
+                HasAuthenticator          = "No"
+                HasPhone                  = "No"
+                HasFIDO2                  = "No"
+                HasSoftwareOATH           = "No"
+                HasEmail                  = "No"
+                HasWHfB                   = "No"
+                HasTAP                    = "No"
+                HasPlatformCredential     = "No"
+                CurrentUserPreferred      = $currentPref
+                SystemPreferred           = $systemPref
+                ConversionEligible        = "No"
+                FailureReason             = "No MFA methods registered"
+            }
+            $allResults.Add($entry)
+            $willFail.Add($entry)
+            continue
+        }
+
+        # --- Categorize methods for this user ---
+        $userCategories = $mfaMethods | ForEach-Object { Get-MethodCategory $_.'@odata.type' }
+
+        $hasAuthenticator = ($userCategories -contains "Microsoft Authenticator")
+        $hasPhone         = ($userCategories -contains "Phone")
+        $hasFIDO2         = ($userCategories -contains "FIDO2 Security Key")
+        $hasSoftwareOATH  = ($userCategories -contains "Software OATH Token")
+        $hasEmail         = ($userCategories -contains "Email")
+        $hasWHfB          = ($userCategories -contains "Windows Hello for Business")
+        $hasTAP           = ($userCategories -contains "Temporary Access Pass")
+        $hasPlatCred      = ($userCategories -contains "Platform Credential")
+
+        # Track distribution
+        foreach ($cat in ($userCategories | Select-Object -Unique)) {
+            if ($methodDistribution.ContainsKey($cat)) { $methodDistribution[$cat]++ }
+            else { $methodDistribution[$cat] = 1 }
+        }
+
+        # --- Eligibility ---
+        # User is eligible if they have at least one strong MFA method registered
+        # (Phone, Authenticator, FIDO2, Software OATH, WHfB, Platform Credential)
+        # Email and TAP alone are NOT sufficient for EAM conversion
+        $strongMethods = $mfaMethods | Where-Object {
+            $_.'@odata.type' -notlike '*emailAuthenticationMethod' -and
+            $_.'@odata.type' -notlike '*temporaryAccessPassAuthenticationMethod'
+        }
+        $isEligible = ($strongMethods.Count -gt 0)
+
+        $failReason = ""
+        if (-not $isEligible) {
+            $failReason = "No strong MFA method registered (Email/TAP only)"
+        }
+
+        # --- Build per-method rows ---
+        foreach ($method in $mfaMethods) {
+            $category = Get-MethodCategory $method.'@odata.type'
+            $detail   = Get-MethodDetail -Method $method -Category $category
+
+            $entry = [PSCustomObject]@{
+                UserPrincipalName         = $user.UserPrincipalName
+                DisplayName               = $user.DisplayName
+                Department                = $user.Department
+                JobTitle                  = $user.JobTitle
+                AccountEnabled            = $user.AccountEnabled
+                MethodCategory            = $category
+                MethodDetail              = $detail
+                MethodId                  = $method.id
+                TotalMFAMethodsRegistered = $mfaMethods.Count
+                HasAuthenticator          = if ($hasAuthenticator) { "Yes" } else { "No" }
+                HasPhone                  = if ($hasPhone) { "Yes" } else { "No" }
+                HasFIDO2                  = if ($hasFIDO2) { "Yes" } else { "No" }
+                HasSoftwareOATH           = if ($hasSoftwareOATH) { "Yes" } else { "No" }
+                HasEmail                  = if ($hasEmail) { "Yes" } else { "No" }
+                HasWHfB                   = if ($hasWHfB) { "Yes" } else { "No" }
+                HasTAP                    = if ($hasTAP) { "Yes" } else { "No" }
+                HasPlatformCredential     = if ($hasPlatCred) { "Yes" } else { "No" }
+                CurrentUserPreferred      = $currentPref
+                SystemPreferred           = $systemPref
+                ConversionEligible        = if ($isEligible) { "Yes" } else { "No" }
+                FailureReason             = $failReason
+            }
+            $allResults.Add($entry)
+        }
+
+        # --- Deduplicated eligible / willFail tracking ---
+        if ($isEligible) {
+            if (-not ($eligible | Where-Object { $_.UserPrincipalName -eq $user.UserPrincipalName })) {
+                $eligible.Add([PSCustomObject]@{
+                    UserPrincipalName = $user.UserPrincipalName
+                    DisplayName       = $user.DisplayName
+                    UserId            = $user.Id
+                    MethodCount       = $mfaMethods.Count
+                    CurrentPreferred  = $currentPref
+                })
+            }
+        }
+        else {
+            if (-not ($willFail | Where-Object { $_.UserPrincipalName -eq $user.UserPrincipalName })) {
+                $willFail.Add(($allResults | Where-Object { $_.UserPrincipalName -eq $user.UserPrincipalName } | Select-Object -First 1))
+            }
+        }
+    }
+    catch {
+        $entry = [PSCustomObject]@{
+            UserPrincipalName         = $user.UserPrincipalName
+            DisplayName               = $user.DisplayName
+            Department                = $user.Department
+            JobTitle                  = $user.JobTitle
+            AccountEnabled            = $user.AccountEnabled
+            MethodCategory            = "ERROR"
+            MethodDetail              = "N/A"
+            MethodId                  = "N/A"
+            TotalMFAMethodsRegistered = 0
+            HasAuthenticator          = "N/A"
+            HasPhone                  = "N/A"
+            HasFIDO2                  = "N/A"
+            HasSoftwareOATH           = "N/A"
+            HasEmail                  = "N/A"
+            HasWHfB                   = "N/A"
+            HasTAP                    = "N/A"
+            HasPlatformCredential     = "N/A"
+            CurrentUserPreferred      = "N/A"
+            SystemPreferred           = "N/A"
+            ConversionEligible        = "No"
+            FailureReason             = $_.Exception.Message
+        }
+        $allResults.Add($entry)
+        $willFail.Add($entry)
+    }
+}
+Write-Progress -Activity "Discovering authentication methods (ACTIVE users)" -Completed
+
+# --- Phase 1 Summary ---
+Write-Host "`n--- DISCOVERY SUMMARY ---" -ForegroundColor Cyan
+Write-Host "Total users in tenant:            $($allUsers.Count)"      -ForegroundColor White
+Write-Host "Active accounts scanned:          $($activeUsers.Count)"   -ForegroundColor White
+Write-Host "Disabled accounts (skipped):      $($disabledUsers.Count)" -ForegroundColor DarkGray
+Write-Host "Eligible for EAM conversion:      $($eligible.Count)"      -ForegroundColor Green
+Write-Host "Will FAIL conversion:             $($willFail.Count)"      -ForegroundColor Red
+
+Write-Host "`n--- METHOD DISTRIBUTION (unique users per method) ---" -ForegroundColor Cyan
+$methodDistribution.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
+    Write-Host ("  {0,-30} {1}" -f $_.Key, $_.Value) -ForegroundColor White
+}
+
+if ($willFail.Count -gt 0) {
+    Write-Host "`nUsers that will FAIL:" -ForegroundColor Yellow
+    $willFail | Format-Table UserPrincipalName, DisplayName, MethodCategory, FailureReason -AutoSize
+}
+
+if ($eligible.Count -gt 0) {
+    Write-Host "`nUsers eligible for EAM conversion:" -ForegroundColor Green
+    $eligible | Format-Table UserPrincipalName, DisplayName, MethodCount, CurrentPreferred -AutoSize
+}
+
+# --- Export full discovery report ---
+$sortedResults = $allResults | Sort-Object UserPrincipalName
+
+if ($useExcel) {
+    $noMFAStyle    = New-ConditionalText "No MFA"  -BackgroundColor "#FFD7D7"
+    $errorStyle    = New-ConditionalText "ERROR"    -BackgroundColor "#FFD7D7"
+    $eligibleStyle = New-ConditionalText "Yes"      -BackgroundColor "#D4EDDA"
+    $notEligStyle  = New-ConditionalText "No"       -BackgroundColor "#FFF3CD"
+
+    $sortedResults | Export-Excel -Path $reportPath `
+        -WorksheetName "AuthMethods" `
+        -TableName "AuthMethodDiscovery" `
+        -TableStyle Medium6 `
+        -AutoSize `
+        -FreezeTopRow `
+        -ConditionalText $noMFAStyle, $errorStyle, $eligibleStyle, $notEligStyle
+
+    # Method distribution summary worksheet
+    $distRows = $methodDistribution.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
+        [PSCustomObject]@{ MethodCategory = $_.Key; UniqueUserCount = $_.Value }
+    }
+    $distRows | Export-Excel -Path $reportPath `
+        -WorksheetName "MethodDistribution" `
+        -TableName "Distribution" `
+        -TableStyle Medium6 `
+        -AutoSize `
+        -FreezeTopRow `
+        -Append
+}
+else {
+    $sortedResults | Export-Csv -Path $reportPath -NoTypeInformation
+}
+Write-Host "`nFull discovery report exported: $reportPath" -ForegroundColor Green
+
+# =============================================
+# PHASE 2 — CONVERSION (with confirmation)
+# =============================================
+if ($eligible.Count -eq 0) {
+    Write-Host "`nNo eligible users found. Nothing to convert. Exiting." -ForegroundColor Yellow
+    Disconnect-MgGraph
+    return
+}
+
+Write-Host "`n===== PHASE 2: CONVERSION TO $ExternalMethodDisplay =====" -ForegroundColor Cyan
+Write-Host "Target: Set userPreferredMethodForSecondaryAuthentication to EAM App ID ($ExternalMethodAppId)" -ForegroundColor White
+$confirm = Read-Host "Proceed with EAM default conversion for $($eligible.Count) eligible users? (Y/N)"
+
+if ($confirm -notin @("Y", "y", "Yes", "yes")) {
+    Write-Host "Conversion cancelled by user. Discovery report still saved." -ForegroundColor Yellow
+    Disconnect-MgGraph
+    return
+}
+
+$convCounter = 0
+$convTotal   = $eligible.Count
+
+foreach ($target in $eligible) {
+    $convCounter++
+    Write-Progress -Activity "Converting default sign-in to $ExternalMethodDisplay" `
+                   -Status "$convCounter of $convTotal — $($target.UserPrincipalName)" `
+                   -PercentComplete (($convCounter / $convTotal) * 100)
+
+    try {
+        $body = @{
+            userPreferredMethodForSecondaryAuthentication = $ExternalMethodAppId
+        } | ConvertTo-Json
+
+        Invoke-MgGraphRequest -Method PATCH `
+            -Uri "https://graph.microsoft.com/beta/users/$($target.UserId)/authentication/signInPreferences" `
+            -Body $body `
+            -ContentType "application/json"
+
+        $changeSuccess.Add([PSCustomObject]@{
+            UserPrincipalName  = $target.UserPrincipalName
+            DisplayName        = $target.DisplayName
+            PreviousPreferred  = $target.CurrentPreferred
+            NewPreferred       = $ExternalMethodDisplay
+            Status             = "Success"
+            Error              = ""
+        })
+    }
+    catch {
+        $changeFailure.Add([PSCustomObject]@{
+            UserPrincipalName  = $target.UserPrincipalName
+            DisplayName        = $target.DisplayName
+            PreviousPreferred  = $target.CurrentPreferred
+            NewPreferred       = $ExternalMethodDisplay
+            Status             = "Failed"
+            Error              = $_.Exception.Message
+        })
+    }
+}
+Write-Progress -Activity "Converting default sign-in to $ExternalMethodDisplay" -Completed
+
+# --- Phase 2 Summary ---
+Write-Host "`n--- CONVERSION SUMMARY ---" -ForegroundColor Cyan
+Write-Host "Target EAM:               $ExternalMethodDisplay ($ExternalMethodAppId)" -ForegroundColor White
+Write-Host "Successfully converted:    $($changeSuccess.Count)" -ForegroundColor Green
+Write-Host "Failed during conversion:  $($changeFailure.Count)" -ForegroundColor Red
+
+# --- Export failure report (discovery failures + conversion failures combined) ---
+$allFailures = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($f in $willFail) {
+    $allFailures.Add([PSCustomObject]@{
+        UserPrincipalName = $f.UserPrincipalName
+        DisplayName       = $f.DisplayName
+        FailureStage      = "Discovery — Not Eligible"
+        Reason            = $f.FailureReason
+    })
+}
+foreach ($f in $changeFailure) {
+    $allFailures.Add([PSCustomObject]@{
+        UserPrincipalName = $f.UserPrincipalName
+        DisplayName       = $f.DisplayName
+        FailureStage      = "Conversion — Runtime Error"
+        Reason            = $f.Error
+    })
+}
+
+if ($allFailures.Count -gt 0) {
+    if ($useExcel) {
+        $allFailures | Export-Excel -Path $failurePath `
+            -WorksheetName "Failures" `
+            -TableName "FailedUsers" `
+            -TableStyle Medium6 `
+            -AutoSize `
+            -FreezeTopRow
+    }
+    else {
+        $allFailures | Export-Csv -Path $failurePath -NoTypeInformation
+    }
+    Write-Host "`nFailure report exported: $failurePath" -ForegroundColor Yellow
+}
+
+if ($changeSuccess.Count -gt 0) {
+    Write-Host "`nSuccessfully converted users:" -ForegroundColor Green
+    $changeSuccess | Format-Table UserPrincipalName, DisplayName, PreviousPreferred, NewPreferred, Status -AutoSize
+}
+
+if ($changeFailure.Count -gt 0) {
+    Write-Host "`nFailed conversion users:" -ForegroundColor Red
+    $changeFailure | Format-Table UserPrincipalName, DisplayName, Error -AutoSize
+}
+
+Disconnect-MgGraph
+Write-Host "`nDone." -ForegroundColor Cyan
