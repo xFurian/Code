@@ -1,0 +1,27 @@
+$ConflictingAddress = Read-Host "Enter the conflicting email address (e.g. user@domain.com)"
+
+# Active user by proxyAddress
+Get-MgUser -Filter "proxyAddresses/any(p:p eq 'smtp:$ConflictingAddress')" -Property DisplayName, UserPrincipalName, ProxyAddresses, OnPremisesSyncEnabled |
+  Select-Object DisplayName, UserPrincipalName, ProxyAddresses, OnPremisesSyncEnabled
+
+# Active user by UPN
+Get-MgUser -Filter "userPrincipalName eq '$ConflictingAddress'" -Property DisplayName, UserPrincipalName, ProxyAddresses, OnPremisesSyncEnabled |
+  Select-Object DisplayName, UserPrincipalName, ProxyAddresses, OnPremisesSyncEnabled
+
+# Soft-deleted users (no server-side filter — client-side match)
+Get-MgDirectoryDeletedItemAsUser -All | Where-Object {
+    $_.ProxyAddresses -match $ConflictingAddress
+} | Select-Object DisplayName, UserPrincipalName, ProxyAddresses
+
+# Groups holding the address
+Get-MgGroup -Filter "proxyAddresses/any(p:p eq 'smtp:$ConflictingAddress')" |
+  Select-Object DisplayName, Id, ProxyAddresses
+
+# Contacts holding the address
+Get-MgContact -Filter "proxyAddresses/any(p:p eq 'smtp:$ConflictingAddress')" |
+  Select-Object DisplayName, Id, ProxyAddresses
+
+# EXO catch-all (any recipient type)
+Get-EXORecipient -ResultSize Unlimited | Where-Object {
+    $_.EmailAddresses -match $ConflictingAddress
+}
